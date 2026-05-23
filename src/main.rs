@@ -41,6 +41,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/sum/:domain/:base_variable/:hours_segment/:run_year/:run_month/:run_day/:run_hhmm/:time_filename",
             get(handlers::sum_path),
         )
+        .route(
+            "/v1/sum_since_0h/:domain/:base_variable/:run_year/:run_month/:run_day/:run_hhmm/:time_filename",
+            get(handlers::sum_since_0h_path),
+        )
         .with_state(Arc::new(state))
         .layer(TraceLayer::new_for_http());
 

@@ -119,6 +119,65 @@ pub async fn sum_path(
     serve(state, req).await
 }
 
+// ---------- /v1/sum_since_0h/:domain/:base_variable/:run_year/:run_month/:run_day/:run_hhmm/:time_filename ----------
+
+#[derive(Debug, Deserialize)]
+pub struct SumSince0hPath {
+    pub domain: String,
+    pub base_variable: String,
+    pub run_year: i32,
+    pub run_month: u32,
+    pub run_day: u32,
+    pub run_hhmm: String,
+    pub time_filename: String,
+}
+
+pub async fn sum_since_0h_path(
+    State(state): State<Arc<AppState>>,
+    Path(p): Path<SumSince0hPath>,
+) -> Result<impl IntoResponse, AppError> {
+    let run_hhmm = p
+        .run_hhmm
+        .strip_suffix('Z')
+        .ok_or_else(|| AppError::BadRequest(format!("invalid run hhmm '{}'", p.run_hhmm)))?;
+    if run_hhmm.len() != 4 {
+        return Err(AppError::BadRequest(format!(
+            "invalid run hhmm '{}'",
+            p.run_hhmm
+        )));
+    }
+    let run_hour: u32 = run_hhmm[..2]
+        .parse()
+        .map_err(|_| AppError::BadRequest("invalid run hour".into()))?;
+    let run_minute: u32 = run_hhmm[2..]
+        .parse()
+        .map_err(|_| AppError::BadRequest("invalid run minute".into()))?;
+
+    let run = Utc
+        .with_ymd_and_hms(p.run_year, p.run_month, p.run_day, run_hour, run_minute, 0)
+        .single()
+        .ok_or_else(|| AppError::BadRequest("invalid run datetime".into()))?;
+
+    let time_str = p
+        .time_filename
+        .strip_suffix(".om")
+        .ok_or_else(|| AppError::BadRequest(format!("expected .om filename: {}", p.time_filename)))?;
+    let time = parse_time_filename(time_str)
+        .ok_or_else(|| AppError::BadRequest(format!("invalid time filename: {time_str}")))?;
+
+    let hours = validate_since_0h(run, time)?;
+
+    let req = AggregateRequest {
+        domain: p.domain,
+        base_variable: p.base_variable.clone(),
+        output_variable: format!("{}_sum_since_0h", p.base_variable),
+        run,
+        time,
+        hours,
+    };
+    serve(state, req).await
+}
+
 fn parse_time_filename(s: &str) -> Option<DateTime<Utc>> {
     // Format: YYYY-MM-DDTHHMM
     if s.len() != 15 {
