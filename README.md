@@ -67,6 +67,20 @@ Réponse identique à la route path-style.
 
 `200 OK` si le service répond.
 
+### `GET /v1/sum_since_0h/:domain/:base_variable/:Y/:M/:D/:HHMMZ/:time.om`
+
+Cumul de `base_variable` depuis 00:00 UTC du jour de `time` (inclus) jusqu'à
+`time` (inclus). Pré-condition : le `run` doit être à 00:00 UTC du même jour
+que `time` — sinon `400 Bad Request`.
+
+Exemple :
+
+```
+GET /v1/sum_since_0h/meteofrance_arome_france_hd/precipitation/2026/05/23/0000Z/2026-05-23T1500.om
+```
+
+Le nom de variable dans l'OMfile retourné est `{base_variable}_sum_since_0h`.
+
 ## Headers de réponse
 
 | Header          | Valeur                                       |
@@ -196,6 +210,10 @@ les exposer dans le menu il faudrait soit forker
 - **Rétention amont 7 jours.** `map-tiles.open-meteo.com` supprime les
   OMfiles spatiaux après 7 jours (header `x-amz-expiration` sur les
   réponses). Au-delà, les requêtes cumul retournent 502.
+- **`sum_since_0h` ne couvre pas les heures avant 00 UTC.** Pour avoir un cumul
+  depuis 00 UTC à n'importe quelle heure de la journée, le run 00 UTC du jour
+  doit être disponible amont. Avant cette publication, le client doit retomber
+  sur `sum_Nh` avec un autre run de référence.
 
 ## Roadmap
 
