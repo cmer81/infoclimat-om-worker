@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Timelike, Utc};
 use serde::Deserialize;
 
 use crate::{AppState, aggregate, error::AppError};
@@ -173,7 +173,6 @@ fn validate(r: &AggregateRequest) -> Result<(), AppError> {
 /// endpoint: the run must be at 00:00 UTC of the calendar day containing `time`.
 /// Returns the number of source steps to aggregate (i.e. `time.hour() + 1`).
 pub fn validate_since_0h(run: DateTime<Utc>, time: DateTime<Utc>) -> Result<u32, AppError> {
-    use chrono::Timelike;
     if run.hour() != 0 || run.minute() != 0 || run.second() != 0 {
         return Err(AppError::BadRequest(format!(
             "sum_since_0h requires run at 00:00 UTC, got {}",
