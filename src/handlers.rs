@@ -169,6 +169,27 @@ fn validate(r: &AggregateRequest) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Validates that a (run, time) pair is admissible for the "sum since 00 UTC"
+/// endpoint: the run must be at 00:00 UTC of the calendar day containing `time`.
+/// Returns the number of source steps to aggregate (i.e. `time.hour() + 1`).
+pub fn validate_since_0h(run: DateTime<Utc>, time: DateTime<Utc>) -> Result<u32, AppError> {
+    use chrono::Timelike;
+    if run.hour() != 0 || run.minute() != 0 || run.second() != 0 {
+        return Err(AppError::BadRequest(format!(
+            "sum_since_0h requires run at 00:00 UTC, got {}",
+            run.to_rfc3339()
+        )));
+    }
+    if run.date_naive() != time.date_naive() {
+        return Err(AppError::BadRequest(format!(
+            "sum_since_0h requires run and time on the same UTC day, got run={} time={}",
+            run.date_naive(),
+            time.date_naive()
+        )));
+    }
+    Ok(time.hour() + 1)
+}
+
 fn om_response(bytes: bytes::Bytes, cache_hit: bool) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -184,4 +205,40 @@ fn om_response(bytes: bytes::Bytes, cache_hit: bool) -> impl IntoResponse {
         HeaderValue::from_static(if cache_hit { "HIT" } else { "MISS" }),
     );
     (StatusCode::OK, headers, bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn validate_since_0h_ok() {
+        let run = Utc.with_ymd_and_hms(2026, 5, 23, 0, 0, 0).unwrap();
+        let time = Utc.with_ymd_and_hms(2026, 5, 23, 15, 0, 0).unwrap();
+        assert_eq!(validate_since_0h(run, time).unwrap(), 16);
+    }
+
+    #[test]
+    fn validate_since_0h_rejects_non_00z_run() {
+        let run = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        let time = Utc.with_ymd_and_hms(2026, 5, 23, 18, 0, 0).unwrap();
+        let err = validate_since_0h(run, time).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_since_0h_rejects_cross_day() {
+        let run = Utc.with_ymd_and_hms(2026, 5, 22, 0, 0, 0).unwrap();
+        let time = Utc.with_ymd_and_hms(2026, 5, 23, 3, 0, 0).unwrap();
+        let err = validate_since_0h(run, time).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_since_0h_at_midnight_returns_one_step() {
+        let run = Utc.with_ymd_and_hms(2026, 5, 23, 0, 0, 0).unwrap();
+        let time = Utc.with_ymd_and_hms(2026, 5, 23, 0, 0, 0).unwrap();
+        assert_eq!(validate_since_0h(run, time).unwrap(), 1);
+    }
 }
