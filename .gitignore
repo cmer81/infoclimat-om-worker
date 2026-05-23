@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local env
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
