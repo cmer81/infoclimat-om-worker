@@ -223,3 +223,30 @@ pub struct DecodedGrid {
     pub offset: f32,
     pub compression: OmCompressionType,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn req(hours: u32, time: DateTime<Utc>, run: DateTime<Utc>) -> AggregateRequest {
+        AggregateRequest {
+            domain: "meteofrance_arome_france_hd".into(),
+            base_variable: "precipitation".into(),
+            output_variable: "precipitation_sum_since_0h".into(),
+            run,
+            time,
+            hours,
+        }
+    }
+
+    #[test]
+    fn source_steps_since_0h_at_15z_returns_16_grids_from_00z() {
+        let run = Utc.with_ymd_and_hms(2026, 5, 23, 0, 0, 0).unwrap();
+        let time = Utc.with_ymd_and_hms(2026, 5, 23, 15, 0, 0).unwrap();
+        let steps = source_steps(&req(16, time, run));
+        assert_eq!(steps.len(), 16);
+        assert_eq!(steps[0], Utc.with_ymd_and_hms(2026, 5, 23, 0, 0, 0).unwrap());
+        assert_eq!(steps[15], time);
+    }
+}
