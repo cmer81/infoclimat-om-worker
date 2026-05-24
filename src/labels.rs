@@ -20,9 +20,10 @@ use omfiles::{
 use serde::Serialize;
 
 use crate::{
-    AppState,
+    AppState, aggregate,
     error::AppError,
     grid::{self, Grid, sampling_step, tile_to_bbox},
+    handlers::AggregateRequest,
 };
 
 /// Resolved request — the handler shapes path params into this.
@@ -57,6 +58,49 @@ pub fn cache_key(r: &LabelsRequest) -> String {
 const MAX_LABELS_PER_SIDE: u32 = 32;
 
 pub async fn compute_labels(state: &Arc<AppState>, r: &LabelsRequest) -> Result<Bytes, AppError> {
+    let fc = if let Some((base_variable, hours)) = parse_sum_variable(&r.variable) {
+        // Sum path: the aggregated OMfile carries values but not crs_wkt/unit
+        // (encode_omfile writes a bare array root). Fetch a source OMfile in
+        // parallel to recover grid metadata and the base variable's unit.
+        let (sum_bytes, src_bytes) = tokio::try_join!(
+            fetch_or_compute_sum(state, r, base_variable.clone(), hours),
+            fetch_source_omfile(state, r),
+        )?;
+        decode_and_sample(
+            src_bytes.to_vec(),
+            &base_variable,
+            Some(sum_bytes.to_vec()),
+            &r.variable,
+            r,
+        )?
+    } else {
+        let bytes = fetch_source_omfile(state, r).await?;
+        decode_and_sample(bytes.to_vec(), &r.variable, None, &r.variable, r)?
+    };
+
+    let json = serde_json::to_vec(&fc)
+        .map_err(|e| AppError::Aggregate(format!("serialize labels json: {e}")))?;
+    Ok(Bytes::from(json))
+}
+
+/// Parses `{base}_sum_{N}h` → `(base, N)`. Returns None if not a sum variable.
+fn parse_sum_variable(v: &str) -> Option<(String, u32)> {
+    let (base, rest) = v.rsplit_once("_sum_")?;
+    if base.is_empty() {
+        return None;
+    }
+    let n_str = rest.strip_suffix('h')?;
+    let n: u32 = n_str.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some((base.to_string(), n))
+}
+
+async fn fetch_source_omfile(
+    state: &Arc<AppState>,
+    r: &LabelsRequest,
+) -> Result<Bytes, AppError> {
     let url = source_url(&state.config.openmeteo_base_url, &r.domain, r.run, r.time);
     tracing::debug!(%url, "fetching spatial omfile for labels");
     let resp = state
@@ -71,15 +115,37 @@ pub async fn compute_labels(state: &Arc<AppState>, r: &LabelsRequest) -> Result<
             resp.status()
         )));
     }
-    let bytes = resp
-        .bytes()
+    resp.bytes()
         .await
-        .map_err(|e| AppError::Upstream(format!("read body {url}: {e}")))?;
+        .map_err(|e| AppError::Upstream(format!("read body {url}: {e}")))
+}
 
-    let fc = decode_and_sample(bytes.to_vec(), r)?;
-    let json = serde_json::to_vec(&fc)
-        .map_err(|e| AppError::Aggregate(format!("serialize labels json: {e}")))?;
-    Ok(Bytes::from(json))
+/// For a `*_sum_Nh` variable, returns the bytes of the aggregated OMfile —
+/// hitting the same R2 cache key as the /v1/sum endpoint so a label tile and
+/// the matching raster tile share work.
+async fn fetch_or_compute_sum(
+    state: &Arc<AppState>,
+    r: &LabelsRequest,
+    base_variable: String,
+    hours: u32,
+) -> Result<Bytes, AppError> {
+    let agg = AggregateRequest {
+        domain: r.domain.clone(),
+        base_variable,
+        output_variable: r.variable.clone(),
+        run: r.run,
+        time: r.time,
+        hours,
+    };
+    let key = aggregate::cache_key(&agg);
+    if let Some(bytes) = state.cache.get(&key).await.map_err(AppError::Cache)? {
+        tracing::info!(%key, "labels: reusing cached sum");
+        return Ok(bytes);
+    }
+    tracing::info!(%key, "labels: computing sum on demand");
+    let bytes = aggregate::compute_sum(state, &agg).await?;
+    state.cache.put(&key, &bytes).await.map_err(AppError::Cache)?;
+    Ok(bytes)
 }
 
 fn source_url(base: &str, domain: &str, run: DateTime<Utc>, time: DateTime<Utc>) -> String {
@@ -94,25 +160,40 @@ fn source_url(base: &str, domain: &str, run: DateTime<Utc>, time: DateTime<Utc>)
     )
 }
 
-fn decode_and_sample(bytes: Vec<u8>, r: &LabelsRequest) -> Result<LabelsResponse, AppError> {
-    let backend = Arc::new(InMemoryBackend::new(bytes));
-    let root =
-        OmFileReader::new(backend).map_err(|e| AppError::Aggregate(format!("open omfile: {e}")))?;
+/// Builds a labels response from up to two OMfile buffers:
+///   - `meta_bytes` / `meta_var`: source for `crs_wkt`, dims and `unit`. Required.
+///   - `value_bytes` / `value_var`: source for the actual values. When `None`,
+///     values are read from `meta_bytes` under `meta_var` (the simple, non-sum
+///     case where everything lives in one upstream OMfile).
+///
+/// In the sum case, `value_bytes` is the worker's own aggregated OMfile —
+/// its root is the array itself (no `crs_wkt` child), so we fall back to
+/// `expect_array` on the root when `get_child_by_name(value_var)` misses.
+fn decode_and_sample(
+    meta_bytes: Vec<u8>,
+    meta_var: &str,
+    value_bytes: Option<Vec<u8>>,
+    value_var: &str,
+    r: &LabelsRequest,
+) -> Result<LabelsResponse, AppError> {
+    let m_backend = Arc::new(InMemoryBackend::new(meta_bytes));
+    let m_root = OmFileReader::new(m_backend)
+        .map_err(|e| AppError::Aggregate(format!("open meta omfile: {e}")))?;
 
-    let wkt = root
+    let wkt = m_root
         .get_child_by_name("crs_wkt")
         .and_then(|c| c.expect_scalar().ok().and_then(|s| s.read_scalar::<String>()))
         .ok_or_else(|| AppError::Aggregate("crs_wkt scalar not found at root".into()))?;
 
-    let var = root
-        .get_child_by_name(&r.variable)
-        .ok_or_else(|| AppError::BadRequest(format!("variable '{}' not found", r.variable)))?;
+    let m_var = m_root
+        .get_child_by_name(meta_var)
+        .ok_or_else(|| AppError::BadRequest(format!("variable '{}' not found", meta_var)))?;
 
-    let arr = var
+    let m_arr = m_var
         .expect_array()
-        .map_err(|e| AppError::Aggregate(format!("variable '{}' not an array: {e}", r.variable)))?;
+        .map_err(|e| AppError::Aggregate(format!("variable '{}' not an array: {e}", meta_var)))?;
 
-    let dims = arr.get_dimensions();
+    let dims: Vec<u64> = m_arr.get_dimensions().to_vec();
     if dims.len() != 2 {
         return Err(AppError::Aggregate(format!(
             "expected 2D variable, got dims={dims:?}"
@@ -121,7 +202,7 @@ fn decode_and_sample(bytes: Vec<u8>, r: &LabelsRequest) -> Result<LabelsResponse
     let rows = dims[0] as u32;
     let cols = dims[1] as u32;
 
-    let unit = var
+    let unit = m_var
         .get_child_by_name("unit")
         .and_then(|c| c.expect_scalar().ok().and_then(|s| s.read_scalar::<String>()));
 
@@ -145,9 +226,47 @@ fn decode_and_sample(bytes: Vec<u8>, r: &LabelsRequest) -> Result<LabelsResponse
     let i_hi = (range.i_max + 1) as u64;
     let j_lo = range.j_min as u64;
     let j_hi = (range.j_max + 1) as u64;
-    let sub = arr
-        .read::<f32>(&[i_lo..i_hi, j_lo..j_hi])
-        .map_err(|e| AppError::Aggregate(format!("read sub-array: {e}")))?;
+    let slice = [i_lo..i_hi, j_lo..j_hi];
+
+    let sub = if let Some(vb) = value_bytes {
+        let v_backend = Arc::new(InMemoryBackend::new(vb));
+        let v_root = OmFileReader::new(v_backend)
+            .map_err(|e| AppError::Aggregate(format!("open value omfile: {e}")))?;
+
+        // The sum format writes the variable as the root array (no children).
+        // The upstream format wraps it as a child under a None root. Accept both.
+        if let Some(child) = v_root.get_child_by_name(value_var) {
+            let arr = child.expect_array().map_err(|e| {
+                AppError::Aggregate(format!("value var '{value_var}' not an array: {e}"))
+            })?;
+            let v_dims: Vec<u64> = arr.get_dimensions().to_vec();
+            if v_dims != dims {
+                return Err(AppError::Aggregate(format!(
+                    "value dims {v_dims:?} differ from meta dims {dims:?}"
+                )));
+            }
+            arr.read::<f32>(&slice)
+                .map_err(|e| AppError::Aggregate(format!("read sub-array: {e}")))?
+        } else {
+            let arr = v_root.expect_array().map_err(|e| {
+                AppError::Aggregate(format!(
+                    "value omfile root is neither an array nor has child '{value_var}': {e}"
+                ))
+            })?;
+            let v_dims: Vec<u64> = arr.get_dimensions().to_vec();
+            if v_dims != dims {
+                return Err(AppError::Aggregate(format!(
+                    "value dims {v_dims:?} differ from meta dims {dims:?}"
+                )));
+            }
+            arr.read::<f32>(&slice)
+                .map_err(|e| AppError::Aggregate(format!("read sub-array: {e}")))?
+        }
+    } else {
+        m_arr
+            .read::<f32>(&slice)
+            .map_err(|e| AppError::Aggregate(format!("read sub-array: {e}")))?
+    };
 
     let mut features: Vec<Feature> = Vec::new();
     let stride = step as usize;
@@ -297,5 +416,28 @@ mod tests {
             key,
             "v1/labels/meteofrance_arpege_europe/temperature_2m/2026-05-24T0000Z/2026-05-25T1500Z/z6/x32/y22.json"
         );
+    }
+
+    #[test]
+    fn parse_sum_variable_matches_basic() {
+        assert_eq!(
+            parse_sum_variable("precipitation_sum_24h"),
+            Some(("precipitation".to_string(), 24))
+        );
+        assert_eq!(
+            parse_sum_variable("snowfall_water_equivalent_sum_3h"),
+            Some(("snowfall_water_equivalent".to_string(), 3))
+        );
+    }
+
+    #[test]
+    fn parse_sum_variable_rejects_non_matching() {
+        assert_eq!(parse_sum_variable("temperature_2m"), None);
+        assert_eq!(parse_sum_variable("precipitation"), None);
+        assert_eq!(parse_sum_variable("precipitation_sum_"), None);
+        assert_eq!(parse_sum_variable("precipitation_sum_24"), None);
+        assert_eq!(parse_sum_variable("precipitation_sum_abch"), None);
+        assert_eq!(parse_sum_variable("_sum_24h"), None);
+        assert_eq!(parse_sum_variable("precipitation_sum_0h"), None);
     }
 }

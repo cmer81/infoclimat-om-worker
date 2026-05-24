@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
-use chrono::{DateTime, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use serde::Deserialize;
 
 use crate::{AppState, aggregate, error::AppError, labels};
@@ -326,6 +326,21 @@ fn validate(r: &AggregateRequest) -> Result<(), AppError> {
     if r.domain.is_empty() || r.base_variable.is_empty() {
         return Err(AppError::BadRequest("domain and variable required".into()));
     }
+    // The cumul window is [time - hours + 1, time]. Open-Meteo's spatial bucket
+    // only contains the *forecast* hours of a run (H+0 onwards), never the
+    // hours preceding the run, so a window whose start is before `run` would
+    // 404 on every step before it. Reject with a clear 400 instead of letting
+    // it explode into an upstream 502.
+    let window_start = r.time - Duration::hours(r.hours as i64 - 1);
+    if window_start < r.run {
+        return Err(AppError::BadRequest(format!(
+            "cumul window starts at {} but run is {} — a run does not contain its past; \
+             pick a run at or before {} (e.g. an earlier model_run)",
+            window_start.to_rfc3339(),
+            r.run.to_rfc3339(),
+            window_start.to_rfc3339(),
+        )));
+    }
     Ok(())
 }
 
@@ -399,5 +414,41 @@ mod tests {
         let run = Utc.with_ymd_and_hms(2026, 5, 23, 0, 0, 0).unwrap();
         let time = Utc.with_ymd_and_hms(2026, 5, 23, 0, 0, 0).unwrap();
         assert_eq!(validate_since_0h(run, time).unwrap(), 1);
+    }
+
+    fn agg(hours: u32, run: DateTime<Utc>, time: DateTime<Utc>) -> AggregateRequest {
+        AggregateRequest {
+            domain: "meteofrance_arome_france_hd".into(),
+            base_variable: "precipitation".into(),
+            output_variable: format!("precipitation_sum_{hours}h"),
+            run,
+            time,
+            hours,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_window_starting_before_run() {
+        // Real-world failure: 24h cumul ending at 22:00 of run 15:00 needs the
+        // 23:00 of the previous day, which doesn't exist in this run's bucket.
+        let run = Utc.with_ymd_and_hms(2026, 5, 24, 15, 0, 0).unwrap();
+        let time = Utc.with_ymd_and_hms(2026, 5, 24, 22, 0, 0).unwrap();
+        let err = validate(&agg(24, run, time)).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_accepts_window_exactly_aligned_with_run() {
+        // 24h cumul ending at H+23 of a 00z run is the tightest legal window.
+        let run = Utc.with_ymd_and_hms(2026, 5, 24, 0, 0, 0).unwrap();
+        let time = Utc.with_ymd_and_hms(2026, 5, 24, 23, 0, 0).unwrap();
+        validate(&agg(24, run, time)).unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_window_fully_after_run() {
+        let run = Utc.with_ymd_and_hms(2026, 5, 24, 0, 0, 0).unwrap();
+        let time = Utc.with_ymd_and_hms(2026, 5, 25, 12, 0, 0).unwrap();
+        validate(&agg(24, run, time)).unwrap();
     }
 }
