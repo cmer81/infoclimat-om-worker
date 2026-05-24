@@ -8,7 +8,7 @@ use axum::{
 use chrono::{DateTime, NaiveDate, TimeZone, Timelike, Utc};
 use serde::Deserialize;
 
-use crate::{AppState, aggregate, error::AppError};
+use crate::{AppState, aggregate, error::AppError, labels};
 
 pub async fn healthz() -> &'static str {
     "ok"
@@ -176,6 +176,107 @@ pub async fn sum_since_0h_path(
         hours,
     };
     serve(state, req).await
+}
+
+// ---------- /v1/labels/:domain/:variable/:run_year/:run_month/:run_day/:run_hhmm/:time/:z/:x/:y.json ----------
+
+#[derive(Debug, Deserialize)]
+pub struct LabelsPath {
+    pub domain: String,
+    pub variable: String,
+    pub run_year: i32,
+    pub run_month: u32,
+    pub run_day: u32,
+    pub run_hhmm: String, // e.g. "0000Z"
+    pub time: String,     // e.g. "2026-05-25T1500"
+    pub z: u8,
+    pub x: u32,
+    pub y_filename: String, // e.g. "22.json"
+}
+
+pub async fn labels_path(
+    State(state): State<Arc<AppState>>,
+    Path(p): Path<LabelsPath>,
+) -> Result<impl IntoResponse, AppError> {
+    let run = parse_run_hhmm(p.run_year, p.run_month, p.run_day, &p.run_hhmm)?;
+    let time = parse_time_filename(&p.time)
+        .ok_or_else(|| AppError::BadRequest(format!("invalid time '{}'", p.time)))?;
+
+    let y_str = p
+        .y_filename
+        .strip_suffix(".json")
+        .ok_or_else(|| AppError::BadRequest(format!("expected .json suffix on y: {}", p.y_filename)))?;
+    let y: u32 = y_str
+        .parse()
+        .map_err(|_| AppError::BadRequest(format!("invalid y '{}'", y_str)))?;
+
+    if p.z > 8 {
+        return Err(AppError::BadRequest(format!(
+            "z={} out of range [0,8]", p.z
+        )));
+    }
+    let max_xy = 1u32 << p.z;
+    if p.x >= max_xy || y >= max_xy {
+        return Err(AppError::BadRequest(format!(
+            "x={} or y={} out of range for z={} (max {})",
+            p.x, y, p.z, max_xy
+        )));
+    }
+
+    let req = labels::LabelsRequest {
+        domain: p.domain,
+        variable: p.variable,
+        run,
+        time,
+        z: p.z,
+        x: p.x,
+        y,
+    };
+
+    let key = labels::cache_key(&req);
+    if let Some(bytes) = state.cache.get(&key).await.map_err(AppError::Cache)? {
+        tracing::info!(%key, "labels cache hit");
+        return Ok(json_response(bytes, true));
+    }
+    tracing::info!(%key, "labels cache miss, computing");
+    let bytes = labels::compute_labels(&state, &req).await?;
+    state.cache.put(&key, &bytes).await.map_err(AppError::Cache)?;
+    Ok(json_response(bytes, false))
+}
+
+fn parse_run_hhmm(year: i32, month: u32, day: u32, hhmm: &str) -> Result<DateTime<Utc>, AppError> {
+    let trimmed = hhmm
+        .strip_suffix('Z')
+        .ok_or_else(|| AppError::BadRequest(format!("invalid run hhmm '{}'", hhmm)))?;
+    if trimmed.len() != 4 {
+        return Err(AppError::BadRequest(format!("invalid run hhmm '{}'", hhmm)));
+    }
+    let h: u32 = trimmed[..2]
+        .parse()
+        .map_err(|_| AppError::BadRequest("invalid run hour".into()))?;
+    let m: u32 = trimmed[2..]
+        .parse()
+        .map_err(|_| AppError::BadRequest("invalid run minute".into()))?;
+    Utc.with_ymd_and_hms(year, month, day, h, m, 0)
+        .single()
+        .ok_or_else(|| AppError::BadRequest("invalid run datetime".into()))
+}
+
+fn json_response(bytes: bytes::Bytes, cache_hit: bool) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        "x-cache",
+        HeaderValue::from_static(if cache_hit { "HIT" } else { "MISS" }),
+    );
+    (StatusCode::OK, headers, bytes)
 }
 
 fn parse_time_filename(s: &str) -> Option<DateTime<Utc>> {
