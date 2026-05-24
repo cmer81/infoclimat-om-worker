@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/labels/:domain/:variable/:run_year/:run_month/:run_day/:run_hhmm/:time/:z/:x/:y_filename",
             get(handlers::labels_path),
         )
+        .route("/v1/tile-proxy/*path", get(handlers::tile_proxy))
         .with_state(Arc::new(state))
         .layer(TraceLayer::new_for_http())
         .layer(

@@ -381,6 +381,83 @@ fn om_response(bytes: bytes::Bytes, cache_hit: bool) -> impl IntoResponse {
     (StatusCode::OK, headers, bytes)
 }
 
+// ---------- /v1/tile-proxy/*path — CORS proxy for tiles.open-meteo.com ----------
+//
+// Upstream basemap host (tiles.open-meteo.com) doesn't serve CORS headers
+// (likely an oversight — their other hosts do). This proxy forwards GETs and
+// rewrites TileJSON so MapLibre keeps hitting us for the .mvt tiles too.
+// Allowlist on path extension keeps it from being abused as an open proxy.
+
+pub async fn tile_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    let allowed = (path.ends_with(".json") || path.ends_with(".mvt") || path.ends_with(".pbf"))
+        && !path.contains("..");
+    if !allowed {
+        return Err(AppError::BadRequest(format!(
+            "tile-proxy: path not allowed: {path}"
+        )));
+    }
+
+    let upstream = format!("https://tiles.open-meteo.com/{path}");
+    let resp = state
+        .http
+        .get(&upstream)
+        .send()
+        .await
+        .map_err(|e| AppError::Upstream(format!("tile-proxy fetch {upstream}: {e}")))?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::Upstream(format!("tile-proxy body: {e}")))?;
+
+    // TileJSON references absolute .mvt URLs back on tiles.open-meteo.com.
+    // Rewrite them to point at us, otherwise MapLibre fetches the tiles
+    // directly and hits the same CORS wall.
+    let final_body: bytes::Bytes = if path.ends_with(".json") {
+        let public_base = derive_public_base(&headers);
+        let text = String::from_utf8_lossy(&body);
+        let rewritten = text.replace(
+            "https://tiles.open-meteo.com/",
+            &format!("{public_base}/v1/tile-proxy/"),
+        );
+        bytes::Bytes::from(rewritten.into_bytes())
+    } else {
+        body
+    };
+
+    let mut builder = axum::response::Response::builder().status(status);
+    if let Some(ct) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, ct);
+    }
+    builder = builder.header(header::CACHE_CONTROL, "public, max-age=86400");
+    builder
+        .body(axum::body::Body::from(final_body))
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("tile-proxy build response: {e}")))
+}
+
+fn derive_public_base(headers: &HeaderMap) -> String {
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost:8080");
+    format!("{proto}://{host}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
