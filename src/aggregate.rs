@@ -28,8 +28,11 @@ pub fn cache_key(r: &AggregateRequest) -> String {
     h.update(r.time.to_rfc3339().as_bytes());
     h.update(b"|");
     h.update(r.hours.to_le_bytes());
+    // v2: OMfile structure changed (variable is now a child of an empty root
+    // container so the JS file reader can navigate to it via getChildByName).
+    // v1 files are unreadable by the client; bump the prefix to invalidate.
     format!(
-        "v1/{}/{}/{}h/{}.om",
+        "v2/{}/{}/{}h/{}.om",
         r.domain,
         r.output_variable,
         r.hours,
@@ -194,9 +197,18 @@ fn encode_omfile(variable: &str, grid: &DecodedGrid) -> Result<Bytes, AppError> 
         arr_writer.finalize()
     };
 
-    let root_offset = writer
+    // Write the data array, then wrap it as a child of an empty root container.
+    // The JS file reader (@openmeteo/file-reader) navigates the OMfile via
+    // `root.getChildByName(<variable>)` — if the array IS the root, it can't
+    // find itself as a child and throws "Variable not found", which silently
+    // breaks rendering. Native Open-Meteo OMfiles follow the same group-with-
+    // child pattern.
+    let arr_offset = writer
         .write_array(finalized, variable, &[])
-        .map_err(|e| AppError::Aggregate(format!("write_array root: {e}")))?;
+        .map_err(|e| AppError::Aggregate(format!("write_array: {e}")))?;
+    let root_offset = writer
+        .write_none("", &[arr_offset])
+        .map_err(|e| AppError::Aggregate(format!("write_none root: {e}")))?;
 
     writer
         .write_trailer(root_offset)
@@ -237,6 +249,34 @@ mod tests {
             run,
             time,
             hours,
+        }
+    }
+
+    #[test]
+    fn encoded_omfile_exposes_variable_as_child_of_root() {
+        use ndarray::Array2;
+        // 3x3 grid of constant 2.0 (e.g. mm of rain)
+        let arr: ArrayD<f32> = Array2::from_elem((3, 3), 2.0_f32).into_dyn();
+        let grid = DecodedGrid {
+            data: arr,
+            dimensions: vec![3, 3],
+            chunk_dimensions: vec![3, 3],
+            scale: 1.0,
+            offset: 0.0,
+            compression: OmCompressionType::PforDelta2dInt16,
+        };
+        let bytes = encode_omfile("precipitation_sum_24h", &grid).expect("encode");
+
+        let backend = Arc::new(InMemoryBackend::new(bytes.to_vec()));
+        let root = OmFileReader::new(backend).expect("open");
+        let child = root
+            .get_child_by_name("precipitation_sum_24h")
+            .expect("child precipitation_sum_24h not found — JS reader will fail the same way");
+
+        let arr = child.expect_array().expect("array");
+        let data: ArrayD<f32> = arr.read::<f32>(&[0..3, 0..3]).expect("read");
+        for v in data.iter() {
+            assert!((v - 2.0).abs() < 0.01, "expected ~2.0, got {v}");
         }
     }
 

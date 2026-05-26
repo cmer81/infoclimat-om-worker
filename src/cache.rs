@@ -40,6 +40,27 @@ impl S3Cache {
         Ok(Self { client, bucket })
     }
 
+    /// Cheap existence check (HEAD object). Used on the redirect path so we
+    /// don't waste bandwidth downloading bytes we won't send to the client.
+    pub async fn exists(&self, key: &str) -> Result<bool, String> {
+        match self.client.head_object().bucket(&self.bucket).key(key).send().await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let raw = format!("{e:?}");
+                let svc_err = e.into_service_error();
+                if svc_err.is_not_found() {
+                    return Ok(false);
+                }
+                let code = svc_err.meta().code().unwrap_or("?");
+                let msg = svc_err.meta().message().unwrap_or("?");
+                Err(format!(
+                    "head_object bucket={} key={} code={code} msg={msg} raw={raw}",
+                    self.bucket, key
+                ))
+            }
+        }
+    }
+
     pub async fn get(&self, key: &str) -> Result<Option<Bytes>, String> {
         match self.client.get_object().bucket(&self.bucket).key(key).send().await {
             Ok(resp) => {

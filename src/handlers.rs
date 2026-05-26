@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use serde::Deserialize;
@@ -293,14 +293,39 @@ fn parse_time_filename(s: &str) -> Option<DateTime<Utc>> {
 
 // ---------- Shared serve logic ----------
 
-async fn serve(state: Arc<AppState>, req: AggregateRequest) -> Result<impl IntoResponse, AppError> {
+async fn serve(state: Arc<AppState>, req: AggregateRequest) -> Result<Response, AppError> {
     validate(&req)?;
 
     let key = aggregate::cache_key(&req);
 
+    // When R2_PUBLIC_URL is configured we let the client fetch directly from
+    // R2 — it supports `Range` natively (the JS OM file reader requires it,
+    // and the inline bytes path returns 200-with-full-body, which makes the
+    // reader throw). We HEAD R2 first to avoid downloading bytes we're not
+    // going to send; on miss we compute, write, and only then redirect.
+    if let Some(public_url) = state.config.r2_public_url.as_deref() {
+        let cache_hit = state.cache.exists(&key).await.map_err(AppError::Cache)?;
+        if !cache_hit {
+            tracing::info!(%key, "cache miss, aggregating");
+            let bytes = aggregate::compute_sum(&state, &req).await?;
+            state
+                .cache
+                .put(&key, &bytes)
+                .await
+                .map_err(AppError::Cache)?;
+        } else {
+            tracing::info!(%key, "cache hit");
+        }
+        let location = format!("{}/{}", public_url, key);
+        return Ok(redirect_response(&location, cache_hit));
+    }
+
+    // Inline fallback for local dev (bucket not public yet). Note: the JS OM
+    // file reader will NOT work against this — it needs HTTP `Range` support
+    // which we don't implement here. Use only for curl-based testing.
     if let Some(bytes) = state.cache.get(&key).await.map_err(AppError::Cache)? {
         tracing::info!(%key, "cache hit");
-        return Ok(om_response(bytes, true));
+        return Ok(om_response(bytes, true).into_response());
     }
 
     tracing::info!(%key, "cache miss, aggregating");
@@ -311,7 +336,26 @@ async fn serve(state: Arc<AppState>, req: AggregateRequest) -> Result<impl IntoR
         .await
         .map_err(AppError::Cache)?;
 
-    Ok(om_response(bytes, false))
+    Ok(om_response(bytes, false).into_response())
+}
+
+fn redirect_response(location: &str, cache_hit: bool) -> Response {
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(location) {
+        headers.insert(header::LOCATION, v);
+    }
+    headers.insert(
+        "x-cache",
+        HeaderValue::from_static(if cache_hit { "HIT" } else { "MISS" }),
+    );
+    // Short-cache the redirect itself so the browser doesn't re-hit us for
+    // every tile request once it has the R2 URL — but stay well under the
+    // immutable cache lifetime that R2 itself advertises.
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+    (StatusCode::TEMPORARY_REDIRECT, headers).into_response()
 }
 
 fn validate(r: &AggregateRequest) -> Result<(), AppError> {
